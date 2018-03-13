@@ -1,7 +1,7 @@
 import tensorflow as tf
 
-INPUT_NODE = 6
-OUTPUT_NODE = 11
+#INPUT_NODE = 17
+#OUTPUT_NODE = 11
 LAYER1_NODE = 500
 
 def get_weight_variable(shape, regularizer):
@@ -12,7 +12,7 @@ def get_weight_variable(shape, regularizer):
     return weights
 
 
-def inference(input_tensor, regularizer):
+def inference(input_tensor, regularizer,INPUT_NODE = 17,OUTPUT_NODE = 11):
     with tf.variable_scope('layer1'):
         weights = get_weight_variable([INPUT_NODE, LAYER1_NODE], regularizer)
         biases = tf.get_variable("biases", [LAYER1_NODE],

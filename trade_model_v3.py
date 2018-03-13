@@ -465,10 +465,8 @@ def train_model( week=g_week,look_back_weeks=g_look_back_weeks):
                 ii*100/len(g_test_securities)))
 
 
-        startDT =g_train_startDT
-
         create_market_data(stock=stock,
-                           start_DateTime=startDT,
+                           start_DateTime=g_train_startDT,
                            stop_DateTime=g_train_stopDT ,
                            week=week, look_back_weeks=g_look_back_weeks)
 
@@ -478,7 +476,7 @@ def train_model( week=g_week,look_back_weeks=g_look_back_weeks):
         if g_max_step<=g_week_in_trade_day:
             continue
 
-        train_count=int(g_max_step) #/look_back_weeks)
+        train_count=int(g_max_step)
 
         g_current_train_stop = 0
         i=g_current_train_stop

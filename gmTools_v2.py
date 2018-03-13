@@ -243,9 +243,8 @@ def get_index_stock(index_symbol,return_list=True):
     # 连接本地终端时，td_addr为localhost:8001,
     if (True):
         try:
-            stock_list=""
             css=get_constituents(index_symbol)
-
+            css.sort()
             return css
         except:
             pass
@@ -332,23 +331,26 @@ get_bars(symbol_list, bar_type, begin_time, end_time)
         end_time	string	结束时间, 如2015-10-30 15:00:00
 return:dataframe  'eob','open','high','low','close','volume','amount'
 '''
-def read_kline(symbol_list, weeks_in_seconds, begin_time, end_time,max_record=50000):
+def read_kline(symbol_list, weeks_in_seconds,
+    begin_time, end_time,max_record=50000):
 
     if(True):
         start_time=begin_time
         stop_time=end_time
         #类结构体转成dataframe
-        columns = ['eob', 'open', 'high', 'low', 'close', 'volume', 'amount']
-        kdata=pd.DataFrame(columns=columns)
-
+        columns = ['eob', 'open', 'high', 'low','close', 'volume', 'amount']
         read_columns = 'eob, open, high, low, close, volume, amount'
+
+
+        kdata = pd.DataFrame(columns=columns)
 
         while (True):
             # 返回结果是bar类数组
             try:
                 bars = history(symbol_list,frequency='%ds'%(weeks_in_seconds),
                                start_time= start_time,end_time= stop_time,
-                               fields=read_columns,adjust=1,df=True)[columns]
+                               fields=read_columns,
+                               adjust=1,df=True)[columns]
 
                 if len(kdata)==0:
                     kdata=bars.copy()
@@ -414,14 +416,6 @@ def read_kline_ts(symbol_list, weeks_in_seconds, begin_time, end_time, max_recor
             else:
                 begin_time = bars[count - 1].strendtime[:10] \
                              + ' ' + bars[count - 1].strendtime[11:19]
-        '''
-        count=len(kdata)
-        if count>0:
-            print("total count:%d,end date:%s " % (count,timestamp_datetime(kdata[count-1][0])))
-        else:
-            print("No data" )
-        '''
-
         return pd.DataFrame(kdata, columns=columns)
 
 def read_last_n_kline(symbol_list, weeks_in_seconds, count, end_time):
