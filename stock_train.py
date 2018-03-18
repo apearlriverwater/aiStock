@@ -15,11 +15,12 @@ LEARNING_RATE_DECAY = 0.99
 REGULARIZATION_RATE = 0.0001
 TRAINING_STEPS = 30000
 MOVING_AVERAGE_DECAY = 0.99
-MODEL_SAVE_PATH="model/"
+MODEL_SAVE_PATH="/zyj/model/"
 MODEL_NAME="stock_model"
 
 '''
-2018-03-13 执行完毕后，第一个股票的模型参数会被自动删除，原因不明。
+2018-03-13 执行完毕后，第一个股票的模型参数会被自动删除，原因不明,原因是保留
+    几个最新的模型文件导致的结果。
     似乎是执行滑动平滑操作后tf自动删除旧数据。
     考虑输出两种模型： 基于特定标的的模型
                     基于组合的模型，需分别验证其有效性    
@@ -88,15 +89,20 @@ def train():
     with tf.Session() as sess:
         tf.global_variables_initializer().run()
         last_acc,last_acc1=-10,-10
-
+        train_count=0
+        no_change_count=0
         for stock in stock_class.get_stock_list():
+            train_count += 1
             train_writer = tf.summary.FileWriter(
                 os.path.join(MODEL_SAVE_PATH,stock_class.STOCK_BLOCK+'.BLK/'+ stock), sess.graph)
             stock_class.create_market_data(stock)
+
+            if len(stock_class.train_x) == 0:
+                continue
+
             next_stock=False
 
             i=0
-            last_step = 0
             while not next_stock:
                 xs, ys,next_stock = stock_class.next_batch()
                 _, loss_value, step,summary = sess.run([train_op, loss, global_step,merged],
@@ -111,30 +117,33 @@ def train():
                       (time.strftime('%Y-%m-%d %H:%M:%S',time.localtime(time.time())),
                        stock, loss_value))
 
-                saver.save(sess, os.path.join(MODEL_SAVE_PATH, stock_class.STOCK_BLOCK+'.BLK/'+ stock+'/'),
-                           global_step=i)
-                saver.save(sess, os.path.join(MODEL_SAVE_PATH, stock_class.STOCK_BLOCK + '.BLK' ),
+                saver.save(sess, os.path.join(MODEL_SAVE_PATH,
+                           stock_class.STOCK_BLOCK + '.BLK/'+stock_class.STOCK_BLOCK),
                            global_step=global_step)
 
-                acc,acc1=stock_eval.evaluate(False)
+                if train_count%2==0:
+                    acc,acc1=stock_eval.evaluate(False)
+                    if abs(last_acc-acc)==0 and abs(last_acc1-acc1)==0:
+                        no_change_count+=1
+                        if no_change_count>5:
+                        #模型参数已确定，没有进一步训练的价值
+                            print('[%s]模型精度已连续5个标的未变化，stop model training!!!'%(
+                                time.strftime('%Y-%m-%d %H:%M:%S',time.localtime(time.time()))))
+                            break
+                    else:
+                        no_change_count=0
+                        last_acc = acc
+                        last_acc1 = acc1
 
-                if abs(last_acc-acc)<=2 and abs(last_acc1-acc1)<=0:
-                    #模型参数已确定，没有进一步训练的价值
-                    print('[%s]stop model training!!!'%(time.strftime('%Y-%m-%d %H:%M:%S',time.localtime(time.time()))))
-                    break
-                else:
-                    last_acc = acc
-                    last_acc1 = acc1
-
-                #检查是否已训练到位  精度不变时不明继续训练没有意义
+                #检查是否已训练到位  精度不变时继续训练没有意义
 
 def main(argv=None):
     train()
 
 if __name__ == '__main__':
-    print(" [%s] start training" %
+    print("=====[%s] start training" %
           (time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time()))))
     tf.app.run()
-    print(" [%s] stop training" %
+    print("=====[%s] stop training" %
           (time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time()))))
 

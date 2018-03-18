@@ -127,6 +127,7 @@ def on_backtest_finished(context, indicator):
     print(indicator)
 
 
+
 if __name__ == '__main__':
     securities = tm.get_stock_list()
     tm.backtest_model()
