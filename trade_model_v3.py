@@ -2,6 +2,7 @@
 
 import tensorflow as tf
 import numpy  as np
+import talib
 import gmTools_v2 as gmTools
 import time
 import  matplotlib.pyplot as plt
@@ -10,6 +11,9 @@ import datetime
 import struct
 
 """ 
+2018-03-15:
+    1)设计成多个神经网络，预测网络解决确定股票池的功能，买卖网络确定最佳买卖时机
+      
 2018-02-28:
     1)考虑把目前的基于股票的串行训练方式改为全标的按时间段统一训练的平行模式，防止利用了未来信息；
     由于各标的情况不一，同一时段内部分标的可能存在停牌情况，数据项不一定相等，采用在特定时段内按
@@ -53,34 +57,35 @@ import struct
 这里的日志路径log_dir非常重要，会存放所有汇总数据供Tensorflow展示。 
 """
 
-#沪深300（SZSE.399300）、
+#沪深300（SHSE.000300）、SHSE.000947 	内地银行  SHSE.000951 	300银行
 #     上证50（SHSE.000016）
-STOCK_BLOCK='SHSE.000016'
+STOCK_BLOCK='SHSE.000300'
 
+g_input_columns=6+7
 MAX_HOLDING=5
+MAX_STOCKS=500
+
+g_train_startDT=datetime.datetime.strptime('2016-01-01 09:00:00', '%Y-%m-%d %H:%M:%S')  # oldest start 2015-01-01
+g_train_stopDT=datetime.datetime.strptime('2018-03-01 09:00:00', '%Y-%m-%d %H:%M:%S')
+g_backtest_stopDT=datetime.datetime.strptime('2018-04-01 09:00:00', '%Y-%m-%d %H:%M:%S')
+
 BUY_GATE=7
 SELL_GATE=3
 BUY_FEE=1E-4
 SELL_FEE=1E-4
 DAY_SECONDS=24*60*60
-MAX_STOCKS=500
-
-g_train_startDT=datetime.datetime.strptime('2005-01-01 09:00:00', '%Y-%m-%d %H:%M:%S')  # oldest start 2015-01-01
-g_train_stopDT=datetime.datetime.strptime('2018-01-01 09:00:00', '%Y-%m-%d %H:%M:%S')
-g_backtest_stopDT=datetime.datetime.strptime('2019-01-01 09:00:00', '%Y-%m-%d %H:%M:%S')
-
 g_max_step = 20000
 g_learning_rate = 0.001
 g_dropout = 0.9
 
 #策略参数
-g_week=10  #freqency
+g_week=60  #freqency
 g_max_holding_days=15
 
-g_input_columns=6
+
 g_trade_minutes=240
 g_week_in_trade_day=int(g_trade_minutes/g_week)
-g_look_back_weeks=max(10,g_week_in_trade_day*2)  #回溯分析的周期数
+g_look_back_weeks=max(10,g_week_in_trade_day*2)*10  #回溯分析的周期数
 g_max_holding_weeks=g_week_in_trade_day*g_max_holding_days  #用于生成持仓周期内的收益等级
 
 
@@ -127,7 +132,7 @@ def get_test_data(data, normalized_data,
     #for i in range(look_back_weeks, len(data)):
     for i in range(look_back_weeks,int(len(data))):
         x = normalized_data.iloc[start- look_back_weeks:start, :]
-        y = data.iloc[start-look_back_weeks:start, -1]
+        y = data.iloc[start-look_back_weeks:start,2]
         start+=1 #look_back_weeks
 
         train_x.append(x.values.tolist())
@@ -138,7 +143,7 @@ def get_test_data(data, normalized_data,
     return train_x, train_y
 
 def create_market_data(stock,start_DateTime,stop_DateTime,
-        week=g_week,look_back_weeks=g_look_back_weeks):
+        week=g_week,look_back_weeks=g_look_back_weeks,hold_weeks=g_max_holding_weeks):
 
     global  g_market_train_data,g_input_columns,\
         g_normalized_data,g_max_step,train_x,train_y
@@ -148,8 +153,8 @@ def create_market_data(stock,start_DateTime,stop_DateTime,
     if len(g_market_train_data)==0:
         return
     #预测look_back_weeks周期后的收益
-    g_market_train_data['label']=g_market_train_data['close'].pct_change(look_back_weeks)
-    g_market_train_data['label']=g_market_train_data['label'].shift(-look_back_weeks)
+    g_market_train_data['label']=g_market_train_data['close'].pct_change(hold_weeks)
+    g_market_train_data['label']=g_market_train_data['label'].shift(-hold_weeks)
     #将数据总项数整理成g_max_holding_weeks的整数倍
     #tmp = len(g_market_train_data)%g_max_holding_weeks+g_max_holding_weeks
     #g_market_train_data =g_market_train_data[tmp:]
@@ -158,7 +163,9 @@ def create_market_data(stock,start_DateTime,stop_DateTime,
     data_tmp = g_market_train_data.iloc[:, 1:-1]
     #todo  加入其他的技术分析指标
 
+    data_tmp=add_ta_factors(data_tmp)
     # 数据归一化处理
+    data_tmp = data_tmp.fillna(0)
 
     mean = np.mean(data_tmp, axis=0)
     std = np.std(data_tmp, axis=0)
@@ -166,14 +173,14 @@ def create_market_data(stock,start_DateTime,stop_DateTime,
 
     g_input_columns=len(data_tmp.columns)
 
-    cols=['eob', 'close','label']
+    cols=['eob', 'close','label','volume', 'amount']  #买卖点分析需要量价信息
     g_market_train_data = g_market_train_data[cols]
     g_max_step = len(g_market_train_data)
 
     #数据规整为look_back_weeks的整数倍
-    remainder=len(g_market_train_data)%look_back_weeks
-    g_market_train_data=g_market_train_data[remainder:]
-    g_normalized_data = g_normalized_data[remainder:]
+    #remainder=len(g_market_train_data)%look_back_weeks
+    #g_market_train_data=g_market_train_data[remainder:]
+    #g_normalized_data = g_normalized_data[remainder:]
 
     train_x,train_y=get_test_data(g_market_train_data,
             g_normalized_data,look_back_weeks)
@@ -358,17 +365,16 @@ def setup_tensor(sess,stock,week,last_utc,next_train_time=0):
         #loss=tf.reduce_sum(1-accuracy)
 
         reward_prediction = tf.argmax(y1, 1)
-        #reward_prediction = tf.reduce_mean(tf.cast(reward, tf.float32))
 
         # 误差在1个单位增益范围内的结果
-        valid_prediction = tf.less_equal(abs(tf.argmax(y1, 1) - tf.argmax(y, 1)), g_stage_rate)
+        valid_prediction = tf.less_equal(abs(tf.argmax(y1, 1) - tf.argmax(y, 1)), 1)
         error=tf.reduce_mean(tf.cast(tf.abs( tf.argmax(y1, 1)-tf.argmax(y, 1)),tf.float32))
         valid_accuracy = tf.reduce_mean(tf.cast(valid_prediction, tf.float32))
         tf.summary.scalar('valid_accuracy', valid_accuracy)
         tf.summary.scalar('error', error)
 
         # 误差在两个单位增益范围内的结果
-        valid_prediction2 = tf.less_equal(abs(tf.argmax(y1, 1) - tf.argmax(y, 1)), 2 * g_stage_rate)
+        valid_prediction2 = tf.less_equal(abs(tf.argmax(y1, 1) - tf.argmax(y, 1)), 2 )
         valid_accuracy2 = tf.reduce_mean(tf.cast(valid_prediction2, tf.float32))
         tf.summary.scalar('valid_accuracy2', valid_accuracy2)
 
@@ -439,13 +445,18 @@ def train_model( week=g_week,look_back_weeks=g_look_back_weeks):
 
     sess = tf.InteractiveSession()
     setup_tensor(sess, STOCK_BLOCK, g_week, 0)
-    saver = tf.train.Saver()
+    saver = tf.train.Saver(max_to_keep=len(g_test_securities)+2)
+
+    sess.run(tf.assign(model_week, g_week))
 
     ii=0
     total_count=0
+    last_acc1=-10
+    last_acc=-10
+    no_change_count=0
 
     for stock in g_test_securities:
-        model_path = g_log_dir + '/train/' + stock
+        model_path = g_log_dir + '/model/'+STOCK_BLOCK+'/'
         model_file = tf.train.latest_checkpoint(model_path)
 
         if model_file:
@@ -453,8 +464,8 @@ def train_model( week=g_week,look_back_weeks=g_look_back_weeks):
                 saver.restore(sess, model_file)
                 week, code, last_utc = sess.run([model_week, model_code, model_last_utc])
                 # code string ,返回是bytes类型，需要转换
-                print("restore from model code=%s,week=%d,last datetime %s" % (
-                    code, week, gmTools.timestamp_datetime(last_utc)))
+                print("restore from model code=%s,week=%d,last_utc %d" % (
+                    code, week, last_utc))
             except:
                 pass
 
@@ -483,7 +494,7 @@ def train_model( week=g_week,look_back_weeks=g_look_back_weeks):
 
         print("training %s" % (g_market_train_data.iloc[0,0].strftime('%Y-%m-%d %H:%M:%S')))
 
-        train_writer = tf.summary.FileWriter(model_path, sess.graph)
+        train_writer = tf.summary.FileWriter(model_path+'/'+stock, sess.graph)
 
         for i in range( look_back_weeks,train_count - 1):
             feed_dict_data=feed_dict(True)
@@ -496,6 +507,23 @@ def train_model( week=g_week,look_back_weeks=g_look_back_weeks):
 
             total_count += 1
 
+        #评估训练的效能  同一模型不能打开两次
+        '''
+        if ii/len(g_test_securities)>0.3:
+            acc, acc1,_ = backtest_model()
+            if abs(last_acc - acc) == 0 and abs(last_acc1 - acc1) == 0:
+                no_change_count += 1
+                if no_change_count > 5:
+                    # 模型参数已确定，没有进一步训练的价值
+                    print('[%s]模型精度已连续5个标的未变化，stop model training!!!' % (
+                        time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time()))))
+                    break
+            else:
+                no_change_count = 0
+                if acc>0:
+                    last_acc = acc
+                    last_acc1 = acc1
+        '''
 
         g_market_train_data = 0
         g_normalized_data = 0
@@ -503,7 +531,12 @@ def train_model( week=g_week,look_back_weeks=g_look_back_weeks):
         train_x = 0
         train_y = 0
 
-        saver.save(sess, model_path + "/model.ckpt")  # save模型
+
+        sess.run(tf.assign(model_code,stock))
+        saver.save(sess, model_path + stock+'/model.ckpt')  # save模型  for stock
+
+        sess.run(tf.assign(model_code, STOCK_BLOCK))
+        saver.save(sess, model_path +STOCK_BLOCK+ '.BLOCK/model.ckpt')  # save模型  for all
 
     sess.close()
     print('total train %d steps'%(total_count))
@@ -511,46 +544,324 @@ def train_model( week=g_week,look_back_weeks=g_look_back_weeks):
 '''
     在价格走势图显示买卖点信息
 '''
-def draw_bs_on_kline(stock,kdata,buy_utc,sell_utc,week=g_week):
+def draw_bs_on_kline(stock,kdata,buy_time,sell_time,week=g_week):
     # 以折线图表示结果 figsize=(20, 15)
     try:
-        plt.figure()
-        data=kdata['close'].values.tolist()
+        plt.figure(figsize=(16, 9))
+        closing = kdata['close'].values
+        data=closing.tolist()
 
-        plot = plt.plot(list(range(len(kdata))),
+        plt.plot(list(range(len(kdata))),
                     data, color='b', label='close')
-        utclist=kdata['eob'].tolist()
 
-        buy_time=buy_utc.strftime('%Y-%m-%d %H:%M:%S')
-        sell_time=sell_utc.strftime('%Y-%m-%d %H:%M:%S')
+        # EMA 指数移动平均线  ma6跌破ma12连续若干周期
+        ma6 = talib.EMA(closing, timeperiod=6)
+        ma12 = talib.EMA(closing, timeperiod=12)
+        ma26 = talib.EMA(closing, timeperiod=26)
 
-        title = ' {2} week={3} \n [{0}--{1}]'.format(buy_time, sell_time, stock,week)
+        plt.plot(list(range(len(kdata))),
+                 ma6,color='r',label='ma6')
+        plt.plot(list(range(len(kdata))),
+                 ma12, color='y',label = 'ma12')
+        plt.plot(list(range(len(kdata))),
+                 ma26, color='g', label='ma26')
 
-        plt.title(title)
+        time_list=kdata['eob'].tolist()
 
-        x=utclist.index(buy_utc)
-        y=data[x]
+        x = time_list.index(buy_time)
+        buy_price = data[x]
+        
+        if buy_time==sell_time:
+            #no sell time,sell on maxholding weeks
+            sell_time=time_list[x+g_max_holding_weeks]
+            no_sell=True
+        else:
+            no_sell=False
 
-        plt.annotate('buy', xy=(x, y),
-                     xytext=(x * 1.1, y),
+        plt.annotate(str(x), xy=(x, buy_price),
+                     xytext=(x * 1.1, buy_price),
                      arrowprops=dict(facecolor='red', shrink=0.05),
                      )
-        x = utclist.index(sell_utc)
-        y = data[x]
+        x = time_list.index(sell_time)
+        sell_price = data[x]
 
-        plt.annotate('sell', xy=(x, y),
-                     xytext=(x * 0.9, y),
+        plt.annotate(str(x), xy=(x, sell_price),
+                     xytext=(x * 0.9, sell_price),
                      arrowprops=dict(facecolor='green', shrink=0.05),
                      )
+        #display start date,mid date and stop date
+        x=5
+        date_high=min(closing)
+        plt.annotate(str(time_list[x].date()), xy=(x, date_high),
+                     xytext=(x , date_high),
+                     arrowprops=dict(facecolor='black', shrink=0.05),
+                     )
+
+        x =int(len(time_list)/2)
+        plt.annotate(str(time_list[x].date()), xy=(x, date_high),
+                     xytext=(x, date_high),
+                     arrowprops=dict(facecolor='black', shrink=0.05),
+                     )
+
+        x = len(time_list)-5
+        plt.annotate(str(time_list[x].date()), xy=(x, date_high),
+                     xytext=(x , date_high),
+                     arrowprops=dict(facecolor='black', shrink=0.05),
+                     )
+
+        reward=int(sell_price*100/buy_price-100)
+        buy_time = buy_time.strftime('%Y-%m-%d %H-%M-%S')
+        sell_time = sell_time.strftime('%Y-%m-%d %H-%M-%S')
+        title = '%s week=%d reward=%d%%\n %s--%s'%(stock, week,reward,buy_time,sell_time)
+
+        if no_sell:
+            title='no sell ' +title
+
+        plt.title(title)
     except:
         pass
 
-    buy_time = buy_utc.strftime('%Y-%m-%d %H-%M-%S')
-    sell_time = sell_utc.strftime('%Y-%m-%d %H-%M-%S')
 
-    file = '{3}/{0}--{1}--{2}.png'.format(stock, buy_time, sell_time,g_log_dir + '/fig' )
+
+    plt.legend(loc='upper left', shadow=True, fontsize='x-large')
+
+
+    file = '%s/%03d-%s-%s-%s.png'%(
+        g_log_dir + '/fig',reward,stock, buy_time, sell_time )
+
     plt.savefig(file)
     plt.close()
+
+    return  reward
+
+#判断当前走势能否买入？
+#todo use tf model to decice the buy-sell point
+def can_buy(kdata,week=3):
+    ret=False
+    closing = kdata['close'].values
+
+    while not ret:
+        # RSI
+        RSI1 = talib.RSI(closing, timeperiod=6)[-1]
+        RSI2 = talib.RSI(closing, timeperiod=14)[-1]
+        RSI3 = talib.RSI(closing, timeperiod=26)[-1]
+        #RSI1>RSI2 and RSI2>RSI3
+        if  (  RSI1<40 or RSI1>80) :
+            break
+
+        # MACD  bar 最新三项大于0且处于金叉后的上升阶段
+        dif, dea, bar = talib.MACD(closing, fastperiod=12, slowperiod=24, signalperiod=9)
+        bar = bar[-week:]
+        dif = dif[-week:]
+        dea = dea[-week:]
+
+        for i in range(1, week):
+            if bar[i] < bar[i - 1] \
+                or dif[i] < dif[i - 1] \
+                or dea[i] < dea[i - 1]:
+                break
+
+        if i < week - 1:
+            break
+
+        # EMA 指数移动平均线  多头发散
+        ma6= talib.EMA(closing, timeperiod=6)[-week:]
+        ma12 = talib.EMA(closing, timeperiod=12)[-week:]
+        ma26 = talib.EMA(closing, timeperiod=26)[-week:]
+
+        for i in range(week):
+            if ma6[-i]<ma12[-i]  \
+               or ma12[-i]<ma26[-i]:
+                break
+
+        if i<week-1:
+            break
+
+        ret=True
+
+    return  ret
+
+def can_sell(kdata,week=3):
+    ret=False
+    closing = kdata['close'].values
+
+    while not ret:
+        # EMA 指数移动平均线  ma6跌破ma12连续若干周期
+        ma6= talib.EMA(closing, timeperiod=6)[-week:]
+        ma12 = talib.EMA(closing, timeperiod=12)[-week:]
+        #ma26 = talib.EMA(closing, timeperiod=26)
+        for i in range(week):
+            if ma6[-i]>=ma12[-i] :
+                break
+
+        if i<week-1:
+            break
+
+        # MACD  bar 最新三项大处于逐步减少的阶段，卖出
+        dif, dea, bar = talib.MACD(closing, fastperiod=12, slowperiod=24, signalperiod=9)
+        bar=bar[-week:]
+        for i in range(1,week):
+            if bar[-i]>=bar[-i+1] :
+                break
+
+        if i<week-1:
+            break
+
+        ret=True
+
+    return  ret
+# 基于talib产生每个周期的技术指标因子
+def add_ta_factors(kdata):
+    opening = kdata['open'].values
+    closing = kdata['close'].values
+    highest = kdata['high'].values
+    lowest = kdata['low'].values
+    #volume = np.double(kdata['volume'].values)
+    tmp = kdata
+
+    # RSI
+    tmp['RSI1'] = talib.RSI(closing, timeperiod=6)
+    tmp['RSI2'] = talib.RSI(closing, timeperiod=14)
+    tmp['RSI3'] = talib.RSI(closing, timeperiod=26)
+    # SAR 抛物线转向
+    tmp['SAR'] = talib.SAR(highest, lowest, acceleration=0.02, maximum=0.2)
+
+    # MACD
+    tmp['MACD_DIF'], tmp['MACD_DEA'], tmp['MACD_bar'] = \
+        talib.MACD(closing, fastperiod=12, slowperiod=24, signalperiod=9)
+
+    '''
+    # EMA 指数移动平均线
+    tmp['EMA6'] = talib.EMA(closing, timeperiod=6)
+    tmp['EMA12'] = talib.EMA(closing, timeperiod=12)
+    tmp['EMA26'] = talib.EMA(closing, timeperiod=26)
+    # OBV 	能量潮指标（On Balance Volume，OBV），以股市的成交量变化来衡量股市的推动力，
+    # 从而研判股价的走势。属于成交量型因子
+    tmp['OBV'] = talib.OBV(closing, volume)
+
+        # 中位数价格 不知道是什么意思
+    tmp['MEDPRICE'] = talib.MEDPRICE(highest, lowest)
+
+    # 负向指标 负向运动
+    tmp['MiNUS_DI'] = talib.MINUS_DI(highest, lowest, closing, timeperiod=14)
+    tmp['MiNUS_DM'] = talib.MINUS_DM(highest, lowest, timeperiod=14)
+
+    # 动量指标（Momentom Index），动量指数以分析股价波动的速度为目的，研究股价在波动过程中各种加速，
+    # 减速，惯性作用以及股价由静到动或由动转静的现象。属于趋势型因子
+    tmp['MOM'] = talib.MOM(closing, timeperiod=10)
+
+    # 归一化平均值范围
+    tmp['NATR'] = talib.NATR(highest, lowest, closing, timeperiod=14)
+    # PLUS_DI 更向指示器
+    tmp['PLUS_DI'] = talib.PLUS_DI(highest, lowest, closing, timeperiod=14)
+    tmp['PLUS_DM'] = talib.PLUS_DM(highest, lowest, timeperiod=14)
+
+    # PPO 价格振荡百分比
+    tmp['PPO'] = talib.PPO(closing, fastperiod=6, slowperiod=26, matype=0)
+
+    # ROC 6日变动速率（Price Rate of Change），以当日的收盘价和N天前的收盘价比较，
+    # 通过计算股价某一段时间内收盘价变动的比例，应用价格的移动比较来测量价位动量。属于超买超卖型因子。
+    tmp['ROC6'] = talib.ROC(closing, timeperiod=6)
+    tmp['ROC20'] = talib.ROC(closing, timeperiod=20)
+    # 12日量变动速率指标（Volume Rate of Change），以今天的成交量和N天前的成交量比较，
+    # 通过计算某一段时间内成交量变动的幅度，应用成交量的移动比较来测量成交量运动趋向，
+    # 达到事先探测成交量供需的强弱，进而分析成交量的发展趋势及其将来是否有转势的意愿，
+    # 属于成交量的反趋向指标。属于成交量型因子
+    tmp['VROC6'] = talib.ROC(volume, timeperiod=6)
+    tmp['VROC20'] = talib.ROC(volume, timeperiod=20)
+
+    # ROC 6日变动速率（Price Rate of Change），以当日的收盘价和N天前的收盘价比较，
+    # 通过计算股价某一段时间内收盘价变动的比例，应用价格的移动比较来测量价位动量。属于超买超卖型因子。
+    tmp['ROCP6'] = talib.ROCP(closing, timeperiod=6)
+    tmp['ROCP20'] = talib.ROCP(closing, timeperiod=20)
+    # 12日量变动速率指标（Volume Rate of Change），以今天的成交量和N天前的成交量比较，
+    # 通过计算某一段时间内成交量变动的幅度，应用成交量的移动比较来测量成交量运动趋向，
+    # 达到事先探测成交量供需的强弱，进而分析成交量的发展趋势及其将来是否有转势的意愿，
+    # 属于成交量的反趋向指标。属于成交量型因子
+    tmp['VROCP6'] = talib.ROCP(volume, timeperiod=6)
+    tmp['VROCP20'] = talib.ROCP(volume, timeperiod=20)
+
+    # 累积/派发线（Accumulation / Distribution Line，该指标将每日的成交量通过价格加权累计，
+    # 用以计算成交量的动量。属于趋势型因子
+    tmp['AD'] = talib.AD(highest, lowest, closing, volume)
+
+    # 佳庆指标（Chaikin Oscillator），该指标基于AD曲线的指数移动均线而计算得到。属于趋势型因子
+    tmp['ADOSC'] = talib.ADOSC(highest, lowest, closing, volume, fastperiod=3, slowperiod=10)
+
+    # 平均动向指数，DMI因子的构成部分。属于趋势型因子
+    tmp['ADX'] = talib.ADX(highest, lowest, closing, timeperiod=14)
+
+    # 相对平均动向指数，DMI因子的构成部分。属于趋势型因子
+    tmp['ADXR'] = talib.ADXR(highest, lowest, closing, timeperiod=14)
+
+    # 绝对价格振荡指数
+    tmp['APO'] = talib.APO(closing, fastperiod=12, slowperiod=26)
+
+    # Aroon通过计算自价格达到近期最高值和最低值以来所经过的期间数，
+    # 帮助投资者预测证券价格从趋势到区域区域或反转的变化，
+    # Aroon指标分为Aroon、AroonUp和AroonDown3个具体指标。属于趋势型因子
+    tmp['AROONDown'], tmp['AROONUp'] = talib.AROON(highest, lowest, timeperiod=14)
+    tmp['AROONOSC'] = talib.AROONOSC(highest, lowest, timeperiod=14)
+
+
+    # 均幅指标（Average TRUE Ranger），取一定时间周期内的股价波动幅度的移动平均值，
+    # 是显示市场变化率的指标，主要用于研判买卖时机。属于超买超卖型因子。
+    tmp['ATR14'] = talib.ATR(highest, lowest, closing, timeperiod=14)
+    tmp['ATR6'] = talib.ATR(highest, lowest, closing, timeperiod=6)
+
+    # 布林带
+    tmp['Boll_Up'], tmp['Boll_Mid'], tmp['Boll_Down'] = \
+        talib.BBANDS(closing, timeperiod=20, nbdevup=2, nbdevdn=2, matype=0)
+
+    # 均势指标
+    tmp['BOP'] = talib.BOP(opening, highest, lowest, closing)
+
+    # 5日顺势指标（Commodity Channel Index），专门测量股价是否已超出常态分布范围。属于超买超卖型因子。
+    tmp['CCI5'] = talib.CCI(highest, lowest, closing, timeperiod=5)
+    tmp['CCI10'] = talib.CCI(highest, lowest, closing, timeperiod=10)
+    tmp['CCI20'] = talib.CCI(highest, lowest, closing, timeperiod=20)
+    tmp['CCI88'] = talib.CCI(highest, lowest, closing, timeperiod=88)
+
+    # 钱德动量摆动指标（Chande Momentum Osciliator），与其他动量指标摆动指标如
+    # 相对强弱指标（RSI）和随机指标（KDJ）不同，
+    # 钱德动量指标在计算公式的分子中采用上涨日和下跌日的数据。属于超买超卖型因子
+    tmp['CMO_Close'] = talib.CMO(closing, timeperiod=14)
+    tmp['CMO_Open'] = talib.CMO(opening, timeperiod=14)
+
+    # DEMA双指数移动平均线
+    tmp['DEMA6'] = talib.DEMA(closing, timeperiod=6)
+    tmp['DEMA12'] = talib.DEMA(closing, timeperiod=12)
+    tmp['DEMA26'] = talib.DEMA(closing, timeperiod=26)
+
+    # DX 动向指数
+    tmp['DX'] = talib.DX(highest, lowest, closing, timeperiod=14)
+
+    # KAMA 适应性移动平均线
+    tmp['KAMA'] = talib.KAMA(closing, timeperiod=30)
+    
+    # TEMA
+    tmp['TEMA6'] = talib.TEMA(closing, timeperiod=6)
+    tmp['TEMA12'] = talib.TEMA(closing, timeperiod=12)
+    tmp['TEMA26'] = talib.TEMA(closing, timeperiod=26)
+
+    # TRANGE 真实范围
+    tmp['TRANGE'] = talib.TRANGE(highest, lowest, closing)
+
+    # TYPPRICE 典型价格
+    tmp['TYPPRICE'] = talib.TYPPRICE(highest, lowest, closing)
+
+    # TSF 时间序列预测
+    tmp['TSF'] = talib.TSF(closing, timeperiod=14)
+
+    # ULTOSC 极限振子
+    tmp['ULTOSC'] = talib.ULTOSC(highest, lowest, closing, timeperiod1=7, timeperiod2=14, timeperiod3=28)
+
+    # 威廉指标
+    tmp['WILLR'] = talib.WILLR(highest, lowest, closing, timeperiod=14)
+    '''
+    return tmp
+
+
 
 '''
     由于掘金返回批量股票K线数据很慢，采用集中获取买卖点信息后统一处理，
@@ -568,28 +879,66 @@ def backtest_model( week=g_week,look_back_weeks=g_look_back_weeks,
     setup_tensor(sess, '', g_week, 0)
     saver = tf.train.Saver()
 
+    acc_list=[]
+    acc, acc1, total=0,0,0
+
+    bacttest_start_date=gmTools.get_backtest_start_date(g_train_stopDT,
+                    int(1.5*g_look_back_weeks/g_week_in_trade_day))
+
     for stock in g_test_securities:
-        print("\n[%s]start backtesting [%s] %.2f%%" % (stock,
-               time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time())),
-               ii * 100 / len(g_test_securities)))
-        ii += 1
-        backtest_stock(stock=stock, sess=sess,saver=saver,
-                       week=g_week,look_back_weeks=g_look_back_weeks,
-                        startDT =g_train_stopDT,stopDT=g_backtest_stopDT)
+        try:
+            print("\n[%s]start backtesting [%s] %.2f%%" % (stock,
+                   time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time())),
+                   ii * 100 / len(g_test_securities)))
+            ii += 1
+            acc0,acc1,acc2,total=backtest_stock(stock=stock, sess=sess,saver=saver,
+                           week=week,look_back_weeks=look_back_weeks,
+                           startDT =bacttest_start_date,
+                           stopDT=stopDT)
+
+            acc_list.append([stock,acc0,acc1,acc2,total])
+        except:
+            print('error in backtest_model, doing [%s]'%(stock))
+
+    acc0_total=0
+    acc1_total=0
+    acc2_total = 0
+    totals=0
+    for (stock,acc0 , acc1 ,acc2, total) in acc_list:
+        if total>0:
+            print("[%s] acc0=%.2f%%,acc1=%.2f%%,acc2=%.2f%%" % (
+                stock, acc0 * 100 / total, acc1 * 100 / total, acc2 * 100 / total))
+
+        acc0_total+=acc0
+        acc1_total += acc1
+        acc2_total += acc2
+        totals+=total
+
+    if totals>0:
+        print("BLOCK  [%s] total acc0=%.2f%%,acc1=%.2f%%,acc2=%.2f%%" % (STOCK_BLOCK,
+                acc0_total * 100 / totals, acc1_total * 100 / totals, acc2_total * 100 / totals))
 
     sess.close()
+
+    return acc,acc1,total
 
 '''
     基于特定股票的回测
 '''
 def backtest_stock(stock,sess,saver, week=g_week,
-       look_back_weeks=g_look_back_weeks,
+       look_back_weeks=g_look_back_weeks,hold_weeks=g_max_holding_weeks,
        startDT =g_train_stopDT,stopDT=g_backtest_stopDT):
 
     global g_train_startDT, g_current_train_stop, g_market_train_data, \
         g_normalized_data, g_max_step, train_x, train_y,reward_prediction
 
-    restore_stock_model(stock,sess,saver)
+    acc0 = 0
+    acc1 = 0
+    acc2 = 0
+    total = 0
+
+    if restore_stock_model(stock,sess,saver)==False:
+        return acc, acc1, total
 
     create_market_data(stock=stock,
                        start_DateTime=startDT ,
@@ -599,7 +948,7 @@ def backtest_stock(stock,sess,saver, week=g_week,
     g_max_step = len(g_market_train_data)
     if g_max_step < look_back_weeks:
         g_market_train_data=0
-        return
+        return acc, acc1, total
 
 
     train_count =g_max_step  # int(g_max_step / look_back_weeks)
@@ -619,46 +968,85 @@ def backtest_stock(stock,sess,saver, week=g_week,
     buy_point = 0
     code_4_buy = []
     code_4_sell = []
-
     # detect buy-sell signal
-    # 最新的look_back_weeks个周期由于没有数据，回测时无法使用
-    for i in range(look_back_weeks, train_count - 1-look_back_weeks):
+    # 最新的hold_weeks个周期由于没有数据，回测时无法使用但可作预测买卖点
+
+    buy_date=0
+    for i in range(look_back_weeks, train_count - 1):
+        #跳过回测范围外的数据
+        if g_market_train_data.iloc[i, 0]<g_train_stopDT:
+            feed_dict(True)
+            continue
+
+
         feed_dict_data = feed_dict(False)
-        reward = sess.run(reward_prediction, feed_dict=feed_dict_data)
+        reward,acc,valid_acc,valid_acc1 = sess.run(
+            [reward_prediction,accuracy,valid_accuracy,valid_accuracy2],
+            feed_dict=feed_dict_data)
+
+        if acc>0.5:
+            acc0+=1
+
+        if valid_acc>0.5:
+            acc1+=1
+
+        if valid_acc1>0.5:
+            acc2+=1
+
+        total+=1
+
+        #买入当日不再判断买卖点
+        if buy_on and g_market_train_data.iloc[i, 0].date()==buy_date:
+            continue
 
         # todo 简单判断未来走势未必合理，是否考虑看均线趋势？
-        index =  i
+        index = 0
         last_reward = last_reward + reward.tolist()
 
-        for j in range(look_back_weeks+1, look_back_weeks + 2):
-            #todo  待建立买点判断模型
-            if not buy_on and last_reward[j - 1] >= BUY_GATE \
-               and last_reward[j - 2] >= BUY_GATE:
-                buy_on = True
-                buy_point = index + j
-                code_4_buy.append({'code': stock,
-                                   'time': g_market_train_data.iloc[buy_point, 0],
-                                   'price': g_market_train_data.iloc[buy_point, 1],
-                                   'reward': last_reward[j - 1]})
+        if True:
+            #todo  待建立买点判断模型  用当前的实际收益情况判断是否适合买入
+            # 利用close真值判断i
+            if not buy_on and last_reward[index - 1] >= BUY_GATE \
+               and last_reward[index - 2] >= BUY_GATE:
+                #利用当前的价格走势确定是否为有效买点
+                #todo maup,rsi,macd??  use tf model to make decision
+                kdata=g_market_train_data.iloc[ i- look_back_weeks:i, :]
 
-            if buy_on and index + j - buy_point > g_week_in_trade_day:
+                if can_buy(kdata):
+                    buy_on = True
+                    buy_point = i
+                    buy_date=g_market_train_data.iloc[buy_point, 0].date()
+                    code_4_buy.append(
+                          {'code': stock,
+                           'time': g_market_train_data.iloc[buy_point, 0],
+                           'price': g_market_train_data.iloc[ i, 1],
+                           'reward': last_reward[index - 1]})
+
+            if buy_on :
                 #todo  待建立卖点判断模型
-                if (last_reward[j - 1] <= SELL_GATE
-                  and last_reward[j - 2] <= SELL_GATE) \
-                  or index + j - buy_point > g_max_holding_weeks:  # arrive max holding weeks
+                kdata = g_market_train_data.iloc[i - look_back_weeks:i, :]
+
+                if can_sell(kdata) \
+                  or i  - buy_point > g_max_holding_weeks:  # arrive max holding weeks
+
                     buy_on = False
                     code_4_sell.append(
                         {'code': stock,
-                        'time': g_market_train_data.iloc[index + j, 0],
-                        'price': g_market_train_data.iloc[index + j, 1],
-                        'reward': last_reward[j - 1]})
+                        'time': g_market_train_data.iloc[i, 0],
+                        'price': g_market_train_data.iloc[ i, 1],
+                        'reward': last_reward[index - 1]})
 
         last_reward = last_reward[-2:]
 
         # train the model
         feed_dict_data = feed_dict(True)
-        summary, _, = sess.run([merged, train_step], feed_dict=feed_dict_data)
+        summary, _, = sess.run(
+            [merged, train_step],
+            feed_dict=feed_dict_data)
         # train_writer.add_summary(summary, i)
+
+    #if total>0:
+    #    print("[%s] acc=%.2f%%,acc1=%.2f%%"%(stock,acc*100/total,acc1*100/total))
 
     g_market_train_data = 0
     g_normalized_data = 0
@@ -727,7 +1115,7 @@ def backtest_stock(stock,sess,saver, week=g_week,
                             k_data = gmTools.read_kline(item['code'], int(week * 60),
                                                         start_datetime, must_sell_datetime)  # k line 数据
 
-                            cols = ['eob', 'close']
+                            cols = ['eob', 'close','volume','amount']
                             k_data = k_data[cols]
 
                             holding.append({'code': item['code'], 'price': item['price'],
@@ -740,25 +1128,20 @@ def backtest_stock(stock,sess,saver, week=g_week,
                 for item in code_4_sell[sell_index:]:
                     if item['time'] == bs_time and item['code'] in holdings:
                         i = holdings.index(item['code'])
-                        # sell
-                        hold_time = (bs_time - holding[i]['time']).total_seconds()
-                        if hold_time > DAY_SECONDS:
-                            # stop loss or had hold for g_max_holding_days
-                            if item['price'] / holding[i]['price'] < 0.9 \
-                                    or hold_time > DAY_SECONDS * g_max_holding_days:
-                                vol = holding[i]['vol']
-                                tmp = vol * item['price'] * (1 - SELL_FEE)
-                                amount += tmp
-                                # todo save bs point in the graph
-                                draw_bs_on_kline(holding[i]['code'],
-                                        holding[i]['kdata'], holding[i]['time'], bs_time)
 
-                                print("[%s] sell %s vol=%d,bs price=[%.2f--%.2f],amt=%.2f,reward=%d,nav=%.2f" %
-                                      (bs_time,item['code'], vol, holding[i]['price'], item['price'], tmp,
-                                       int(item['price'] * 100 / holding[i]['price'] - 100), amount))
+                        vol = holding[i]['vol']
+                        tmp = vol * item['price'] * (1 - SELL_FEE)
+                        amount += tmp
+                        # todo save bs point in the graph
+                        draw_bs_on_kline(holding[i]['code'],
+                                holding[i]['kdata'], holding[i]['time'], bs_time)
 
-                                holding.pop(i)
-                                holdings.pop(i)
+                        print("[%s] sell %s vol=%d,bs price=[%.2f--%.2f],amt=%.2f,reward=%d,nav=%.2f" %
+                              (bs_time,item['code'], vol, holding[i]['price'], item['price'], tmp,
+                               int(item['price'] * 100 / holding[i]['price'] - 100), amount))
+
+                        holding.pop(i)
+                        holdings.pop(i)
 
                         sell_index += 1
                         bs_index_changed = True
@@ -774,39 +1157,58 @@ def backtest_stock(stock,sess,saver, week=g_week,
                 bs_index_changed = False
 
         except:
-            print('error backtest_model')
+            print('error backtest_model [%s]'%(stock))
             pass
 
     #todo 增加最后持仓的卖出处理
+    if len(holding) > 0:
+        i=0
+        # todo save bs point in the graph
+        draw_bs_on_kline(holding[i]['code'],
+                         holding[i]['kdata'], holding[i]['time'], holding[i]['time'])
 
-    model_path = g_log_dir + '/train/' + stock
-    saver.save(sess, model_path + "/model.ckpt")  # save模型
+        '''
+        bs_time = holding[i]['time']
+        vol = holding[i]['vol']
+        tmp = vol * item['price'] * (1 - SELL_FEE)
+        amount += tmp
+        print("[%s] sell %s vol=%d,bs price=[%.2f--%.2f],amt=%.2f,reward=%d,nav=%.2f" %
+              (bs_time, item['code'], vol, holding[i]['price'], item['price'], tmp,
+               int(item['price'] * 100 / holding[i]['price'] - 100), amount))
+        '''
+    #sess.run(tf.assign(model_code,stock))
+    #model_path = g_log_dir + '/model/' + stock
+    #saver.save(sess, model_path + "/model.ckpt")  # save模型
     #sess.close()
 
     print("\nstop backtest_model [%s]" % (
         time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time()))))
 
+    return acc0,acc1,acc2,total
 '''
     基于特定股票的回测模型恢复
 '''
 def restore_stock_model(stock,sess,saver):
+    paths=g_log_dir + '/model/'+STOCK_BLOCK+'/'
+    model_paths =[paths+stock,paths+STOCK_BLOCK+'.BLOCK']
+    ret=False
+    for model_path in model_paths:
+        model = tf.train.latest_checkpoint(model_path)
 
-    model_path = g_log_dir + '/train/'+stock
+        if model:
+            try:
+                saver.restore(sess, model)
+                week, code = sess.run([model_week, model_code])
+                # code string ,返回是bytes类型，需要转换
+                print("restore from model code=%s,week=%d" % (
+                    code, week))
+                ret=True
+                break
+            except:
+                #print("restore from [%s] error"%(model_path))
+                pass
 
-
-    model_file = tf.train.latest_checkpoint(model_path)
-
-    if model_file:
-        try:
-            saver.restore(sess, model_file)
-            week, code = sess.run([model_week, model_code])
-            # code string ,返回是bytes类型，需要转换
-            print("restore from model code=%s,week=%d" % (
-                code, week))
-        except:
-            print("restore from model error")
-
-    return  sess,saver
+    return  ret
 
 #返回字典列表
 def get_bs_list( stop_dt='',week=g_week,
